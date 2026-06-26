@@ -1,0 +1,459 @@
+/* ============================================================
+   الجدول الذكي للجامعة — script.js
+   Handles: schedule grid generation, course add/delete,
+            to-do list add/check/delete, localStorage persistence.
+   ============================================================ */
+
+// ---------- TIME SLOTS CONFIG ----------
+const TIME_SLOTS = [
+  '08:00\n09:00',
+  '09:00\n10:00',
+  '10:00\n11:00',
+  '11:00\n12:00',
+  '12:00\n13:00',
+  '13:00\n14:00',
+  '14:00\n15:00',
+  '15:00\n16:00',
+  '16:00\n17:00',
+  '17:00\n18:00',
+];
+
+const DAYS_COUNT = 5;   // Sunday → Thursday
+const COLS = 6;         // 1 time col + 5 day cols
+
+// Colour index cycles 0–4 to colour-code courses visually
+let colorIndex = 0;
+
+// ---------- STATE: loaded from localStorage on startup ----------
+let courses = [];   // [{ id, name, instructor, room, day, time, color }]
+let todos   = [];   // [{ id, text, done }]
+
+// ---------- DOM REFERENCES ----------
+const scheduleGrid   = document.getElementById('scheduleGrid');
+const emptySchedule  = document.getElementById('emptySchedule');
+const todoList       = document.getElementById('todoList');
+const emptyTodo      = document.getElementById('emptyTodo');
+const modalOverlay   = document.getElementById('modalOverlay');
+const openModalBtn   = document.getElementById('openModalBtn');
+const closeModalBtn  = document.getElementById('closeModalBtn');
+const saveCourseBtn  = document.getElementById('saveCourseBtn');
+const addTodoBtn     = document.getElementById('addTodoBtn');
+const todoInput      = document.getElementById('todoInput');
+const formError      = document.getElementById('formError');
+const toast          = document.getElementById('toast');
+
+// Form inputs
+const inpCourseName  = document.getElementById('courseName');
+const inpInstructor  = document.getElementById('instructor');
+const inpRoom        = document.getElementById('room');
+const inpDay         = document.getElementById('daySelect');
+const inpTime        = document.getElementById('timeSelect');
+
+// ---------- INIT ----------
+document.addEventListener('DOMContentLoaded', () => {
+  loadFromStorage();
+  buildGrid();
+  renderAllCourses();
+  renderTodos();
+  bindEvents();
+});
+
+// ---------- LOCAL STORAGE ----------
+
+/** Save current state arrays to localStorage */
+function saveToStorage() {
+  localStorage.setItem('smart_courses', JSON.stringify(courses));
+  localStorage.setItem('smart_todos',   JSON.stringify(todos));
+}
+
+/** Load state from localStorage on page load */
+function loadFromStorage() {
+  try {
+    const c = localStorage.getItem('smart_courses');
+    const t = localStorage.getItem('smart_todos');
+    if (c) courses = JSON.parse(c);
+    if (t) todos   = JSON.parse(t);
+
+    // Restore colorIndex to continue from where we left off
+    if (courses.length) {
+      colorIndex = (Math.max(...courses.map(c => c.color)) + 1) % 5;
+    }
+  } catch (_) {
+    // If parsing fails, start fresh
+    courses = [];
+    todos   = [];
+  }
+}
+
+// ---------- SCHEDULE GRID BUILD ----------
+
+/**
+ * Builds the static grid skeleton (time rows × day columns).
+ * Day headers were already written in HTML.
+ * This function appends the time label + 5 empty cells for each slot.
+ */
+function buildGrid() {
+  TIME_SLOTS.forEach((slot, rowIndex) => {
+    // Time label cell
+    const timeCell = document.createElement('div');
+    timeCell.classList.add('time-label');
+    timeCell.style.whiteSpace = 'pre';   // preserve newline between times
+    timeCell.textContent = slot;
+    scheduleGrid.appendChild(timeCell);
+
+    // 5 day cells for this time row
+    for (let dayIndex = 0; dayIndex < DAYS_COUNT; dayIndex++) {
+      const cell = document.createElement('div');
+      cell.classList.add('sched-cell');
+      // Use data attributes to identify the cell easily
+      cell.dataset.day  = dayIndex;
+      cell.dataset.time = rowIndex;
+      scheduleGrid.appendChild(cell);
+    }
+  });
+}
+
+// ---------- COURSES: RENDER ----------
+
+/** Re-renders all saved courses into the grid */
+function renderAllCourses() {
+  // Clear all existing course cards first
+  document.querySelectorAll('.sched-cell').forEach(cell => {
+    cell.innerHTML = '';
+  });
+
+  courses.forEach(course => placeCourseInGrid(course));
+  updateScheduleEmptyState();
+}
+
+/**
+ * Places a single course card inside the correct grid cell.
+ * @param {Object} course
+ */
+function placeCourseInGrid(course) {
+  const cell = document.querySelector(
+    `.sched-cell[data-day="${course.day}"][data-time="${course.time}"]`
+  );
+  if (!cell) return;
+
+  const card = document.createElement('div');
+  card.classList.add('course-card');
+  card.dataset.color = course.color;
+  card.dataset.id    = course.id;
+
+  // Inner content
+  card.innerHTML = `
+    <button class="card-delete" title="حذف المادة" data-id="${course.id}">✕</button>
+    <span class="course-name">${escapeHtml(course.name)}</span>
+    <div class="course-meta">
+      ${course.instructor ? `<span>👤 ${escapeHtml(course.instructor)}</span>` : ''}
+      ${course.room       ? `<span>📍 ${escapeHtml(course.room)}</span>`       : ''}
+    </div>
+  `;
+
+  cell.appendChild(card);
+}
+
+/** Shows/hides the empty-state placeholder for the schedule */
+function updateScheduleEmptyState() {
+  if (courses.length === 0) {
+    emptySchedule.classList.add('visible');
+  } else {
+    emptySchedule.classList.remove('visible');
+  }
+}
+
+// ---------- COURSES: ADD & DELETE ----------
+
+/** Reads the modal form, validates, and adds a new course */
+function addCourse() {
+  const name = inpCourseName.value.trim();
+  const day  = inpDay.value;
+  const time = inpTime.value;
+
+  // Validation
+  if (!name) {
+    showFormError('يرجى إدخال اسم المادة');
+    inpCourseName.focus();
+    return;
+  }
+  if (day === '') {
+    showFormError('يرجى اختيار اليوم');
+    return;
+  }
+  if (time === '') {
+    showFormError('يرجى اختيار وقت المحاضرة');
+    return;
+  }
+
+  // Check if the slot is already occupied
+  const conflict = courses.find(
+    c => c.day === Number(day) && c.time === Number(time)
+  );
+  if (conflict) {
+    showFormError(`هذا الوقت محجوز لمادة: ${conflict.name}`);
+    return;
+  }
+
+  // Build course object
+  const course = {
+    id:         Date.now(),
+    name:       name,
+    instructor: inpInstructor.value.trim(),
+    room:       inpRoom.value.trim(),
+    day:        Number(day),
+    time:       Number(time),
+    color:      colorIndex,
+  };
+
+  colorIndex = (colorIndex + 1) % 5;
+
+  courses.push(course);
+  saveToStorage();
+  placeCourseInGrid(course);
+  updateScheduleEmptyState();
+  closeModal();
+  showToast(`✅ تمت إضافة "${course.name}" بنجاح`);
+}
+
+/**
+ * Deletes a course by its ID.
+ * @param {number} id
+ */
+function deleteCourse(id) {
+  courses = courses.filter(c => c.id !== id);
+  saveToStorage();
+
+  // Remove the card from the DOM
+  const card = document.querySelector(`.course-card[data-id="${id}"]`);
+  if (card) {
+    card.style.transform = 'scale(0)';
+    card.style.opacity   = '0';
+    card.style.transition = 'all 0.2s ease';
+    setTimeout(() => card.remove(), 200);
+  }
+
+  updateScheduleEmptyState();
+  showToast('🗑️ تم حذف المادة');
+}
+
+// ---------- TO-DO LIST ----------
+
+/** Adds a new task from the text input */
+function addTodo() {
+  const text = todoInput.value.trim();
+  if (!text) {
+    todoInput.focus();
+    return;
+  }
+
+  const todo = {
+    id:   Date.now(),
+    text: text,
+    done: false,
+  };
+
+  todos.push(todo);
+  saveToStorage();
+  renderTodoItem(todo);
+  updateTodoEmptyState();
+
+  todoInput.value = '';
+  todoInput.focus();
+  showToast('📝 تمت إضافة المهمة', 'teal');
+}
+
+/** Renders all todos (used on page load) */
+function renderTodos() {
+  todoList.innerHTML = '';
+  todos.forEach(todo => renderTodoItem(todo));
+  updateTodoEmptyState();
+}
+
+/**
+ * Creates and appends a single <li> for a todo item.
+ * @param {Object} todo
+ */
+function renderTodoItem(todo) {
+  const li = document.createElement('li');
+  li.classList.add('todo-item');
+  if (todo.done) li.classList.add('done');
+  li.dataset.id = todo.id;
+
+  li.innerHTML = `
+    <input type="checkbox" class="todo-checkbox" ${todo.done ? 'checked' : ''}
+      aria-label="تم إنجاز المهمة" />
+    <span class="todo-text">${escapeHtml(todo.text)}</span>
+    <button class="btn btn-danger todo-del-btn" title="حذف المهمة">حذف</button>
+  `;
+
+  todoList.appendChild(li);
+}
+
+/**
+ * Toggles a todo's done state.
+ * @param {number} id
+ * @param {boolean} done
+ */
+function toggleTodo(id, done) {
+  const todo = todos.find(t => t.id === id);
+  if (todo) {
+    todo.done = done;
+    saveToStorage();
+  }
+  const li = todoList.querySelector(`[data-id="${id}"]`);
+  if (li) li.classList.toggle('done', done);
+}
+
+/**
+ * Deletes a todo item by ID.
+ * @param {number} id
+ */
+function deleteTodo(id) {
+  todos = todos.filter(t => t.id !== id);
+  saveToStorage();
+
+  const li = todoList.querySelector(`[data-id="${id}"]`);
+  if (li) {
+    li.style.opacity   = '0';
+    li.style.transform = 'translateX(-12px)';
+    li.style.transition = 'all 0.2s ease';
+    setTimeout(() => { li.remove(); updateTodoEmptyState(); }, 200);
+  }
+}
+
+/** Shows/hides the empty-state placeholder for the todo list */
+function updateTodoEmptyState() {
+  if (todos.length === 0) {
+    emptyTodo.classList.add('visible');
+  } else {
+    emptyTodo.classList.remove('visible');
+  }
+}
+
+// ---------- MODAL HELPERS ----------
+
+function openModal() {
+  clearForm();
+  modalOverlay.classList.add('open');
+  inpCourseName.focus();
+}
+
+function closeModal() {
+  modalOverlay.classList.remove('open');
+  clearForm();
+}
+
+function clearForm() {
+  inpCourseName.value  = '';
+  inpInstructor.value  = '';
+  inpRoom.value        = '';
+  inpDay.value         = '';
+  inpTime.value        = '';
+  formError.textContent = '';
+}
+
+function showFormError(msg) {
+  formError.textContent = msg;
+}
+
+// ---------- TOAST NOTIFICATION ----------
+
+let toastTimer;
+
+/**
+ * Shows a brief toast notification at the bottom of the screen.
+ * @param {string} message
+ * @param {string} [type=''] - '' | 'teal' | 'error'
+ */
+function showToast(message, type = '') {
+  clearTimeout(toastTimer);
+  toast.textContent = message;
+  toast.className   = `toast${type ? ' ' + type : ''}`;
+
+  // Force reflow so transition triggers even if toast is already showing
+  void toast.offsetWidth;
+  toast.classList.add('show');
+
+  toastTimer = setTimeout(() => {
+    toast.classList.remove('show');
+  }, 2800);
+}
+
+// ---------- UTILITY ----------
+
+/**
+ * Escapes HTML special characters to prevent XSS.
+ * @param {string} str
+ * @returns {string}
+ */
+function escapeHtml(str) {
+  return str
+    .replace(/&/g,  '&amp;')
+    .replace(/</g,  '&lt;')
+    .replace(/>/g,  '&gt;')
+    .replace(/"/g,  '&quot;')
+    .replace(/'/g,  '&#039;');
+}
+
+// ---------- EVENT BINDING ----------
+
+function bindEvents() {
+
+  // --- MODAL open / close ---
+  openModalBtn.addEventListener('click', openModal);
+  closeModalBtn.addEventListener('click', closeModal);
+
+  // Close modal when clicking outside the modal box
+  modalOverlay.addEventListener('click', (e) => {
+    if (e.target === modalOverlay) closeModal();
+  });
+
+  // Close modal on Escape key
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && modalOverlay.classList.contains('open')) {
+      closeModal();
+    }
+  });
+
+  // --- Save course button ---
+  saveCourseBtn.addEventListener('click', addCourse);
+
+  // Also allow Enter key in the last field to submit
+  [inpCourseName, inpInstructor, inpRoom].forEach(inp => {
+    inp.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') addCourse();
+    });
+  });
+
+  // --- Course card delete (event delegation on the grid) ---
+  scheduleGrid.addEventListener('click', (e) => {
+    const btn = e.target.closest('.card-delete');
+    if (btn) {
+      const id = Number(btn.dataset.id);
+      deleteCourse(id);
+    }
+  });
+
+  // --- TO-DO: add ---
+  addTodoBtn.addEventListener('click', addTodo);
+
+  todoInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') addTodo();
+  });
+
+  // --- TO-DO: toggle / delete (event delegation) ---
+  todoList.addEventListener('change', (e) => {
+    if (e.target.classList.contains('todo-checkbox')) {
+      const li = e.target.closest('.todo-item');
+      if (li) toggleTodo(Number(li.dataset.id), e.target.checked);
+    }
+  });
+
+  todoList.addEventListener('click', (e) => {
+    if (e.target.classList.contains('todo-del-btn')) {
+      const li = e.target.closest('.todo-item');
+      if (li) deleteTodo(Number(li.dataset.id));
+    }
+  });
+}
